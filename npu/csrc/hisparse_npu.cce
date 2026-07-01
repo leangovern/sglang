@@ -1,0 +1,441 @@
+/**
+ * @file hisparse_npu.cce
+ * @brief Ascend C implementation of load_cache_to_device_buffer_mla for HiSparse
+ * 
+ * This is the NPU version of the CUDA JIT-compiled kernel for SGlang's
+ * HiSparse (Hierarchical Sparse KV Cache) system.
+ * 
+ * Key design decisions:
+ * 1. One block per request (block_idx = req_id)
+ * 2. SIMD (Vector Unit) parallel comparison for hit detection using VecCmpEQ
+ * 3. Simple timestamp-based LRU management (uint32_t per slot)
+ * 4. MTE DataCopy from Host to Device with CacheMode::NoCache
+ * 5. Fast path for short sequences (token_id < hot_buffer_size)
+ * 
+ * Note: This uses runtime parameters (num_top_k, hot_buffer_size) instead of
+ * compile-time templates to avoid combinatorial explosion.
+ */
+
+#include "kernel_operator.h"
+#include <stdint.h>
+
+using namespace AscendC;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// SIMD width for int32 comparison. Ascend NPU Vector Unit typically processes
+// 2048 bits per operation. For int32 (32 bits), that's 64 elements per vector.
+// Using a conservative value that works across different NPU generations.
+constexpr int32_t SIMD_WIDTH = 64;
+
+// Invalid token sentinel value
+constexpr int32_t INVALID_TOKEN = -1;
+
+// Maximum supported hot_buffer_size to fit in UB (Unified Buffer).
+// UB capacity is typically 256KB-512KB depending on the chip.
+// We need: tokens (int32) + lru (uint32) + query (int32) = ~8 bytes per slot + overhead.
+// 8192 slots * 8 bytes = ~64KB, well within UB limits.
+constexpr int32_t MAX_HOT_BUFFER_SIZE = 8192;
+
+// ============================================================================
+// Operator Class
+// ============================================================================
+
+class LoadCacheToDeviceBufferMla {
+public:
+    __aicore__ inline LoadCacheToDeviceBufferMla() 
+        : max_seq_len_(0), current_time_(0) {}
+
+    /**
+     * @brief Initialize operator with runtime parameters and setup GlobalTensors.
+     */
+    __aicore__ inline void Init(
+        GM_ADDR top_k_tokens,
+        GM_ADDR device_buffer_tokens,
+        GM_ADDR host_cache_locs,
+        GM_ADDR device_buffer_locs,
+        GM_ADDR host_cache_k,
+        GM_ADDR device_buffer_k,
+        GM_ADDR top_k_device_locs,
+        GM_ADDR lru_slots,
+        GM_ADDR num_real_reqs,
+        int32_t num_reqs,
+        int64_t item_size_bytes,
+        int32_t num_top_k,
+        int32_t hot_buffer_size
+    ) {
+        // Save raw __gm__ pointers for scalar direct access (more efficient
+        // for single-element reads/writes than DataCopy in some cases)
+        top_k_tokens_ptr_ = (__gm__ int32_t*)top_k_tokens;
+        device_buffer_tokens_ptr_ = (__gm__ int32_t*)device_buffer_tokens;
+        host_cache_locs_ptr_ = (__gm__ int64_t*)host_cache_locs;
+        device_buffer_locs_ptr_ = (__gm__ int32_t*)device_buffer_locs;
+        host_cache_k_ptr_ = (__gm__ uint8_t*)host_cache_k;
+        device_buffer_k_ptr_ = (__gm__ uint8_t*)device_buffer_k;
+        top_k_device_locs_ptr_ = (__gm__ int32_t*)top_k_device_locs;
+        lru_slots_ptr_ = (__gm__ uint32_t*)lru_slots;
+        num_real_reqs_ptr_ = (__gm__ int32_t*)num_real_reqs;
+
+        // Setup GlobalTensors for vector operations
+        top_k_tokens_gm_.SetGlobalBuffer((__gm__ int32_t*)top_k_tokens);
+        device_buffer_tokens_gm_.SetGlobalBuffer((__gm__ int32_t*)device_buffer_tokens);
+        device_buffer_locs_gm_.SetGlobalBuffer((__gm__ int32_t*)device_buffer_locs);
+        host_cache_locs_gm_.SetGlobalBuffer((__gm__ int64_t*)host_cache_locs);
+        host_cache_k_gm_.SetGlobalBuffer((__gm__ uint8_t*)host_cache_k);
+        device_buffer_k_gm_.SetGlobalBuffer((__gm__ uint8_t*)device_buffer_k);
+        lru_slots_gm_.SetGlobalBuffer((__gm__ uint32_t*)lru_slots);
+        top_k_device_locs_gm_.SetGlobalBuffer((__gm__ int32_t*)top_k_device_locs);
+
+        // Get max_seq_len from host_cache_locs tensor shape.
+        // host_cache_locs shape: [num_reqs, max_seq_len]
+        // If GetTensorDesc is not available on your CANN version, you may need
+        // to pass max_seq_len as an additional runtime parameter.
+        const auto& desc = host_cache_locs_gm_.GetTensorDesc();
+        const auto& shape = desc.GetShape();
+        max_seq_len_ = static_cast<int32_t>(shape.GetDim(1));
+        if (max_seq_len_ <= 0) {
+            // Fallback: if shape info is unavailable, assume a reasonable default.
+            // This should be verified against the Python layer's actual max_seq_len.
+            max_seq_len_ = hot_buffer_size;
+        }
+
+        num_reqs_ = num_reqs;
+        item_size_bytes_ = item_size_bytes;
+        num_top_k_ = num_top_k;
+        hot_buffer_size_ = hot_buffer_size;
+    }
+
+    /**
+     * @brief Main processing logic.
+     * Each block handles one request (req_id = block_idx).
+     */
+    __aicore__ inline void Process() {
+        uint32_t req_id = GetBlockIdx();
+
+        // Read num_real_reqs (only the first request actually needs to run)
+        int32_t real_reqs = num_real_reqs_ptr_[0];
+        if (req_id >= static_cast<uint32_t>(real_reqs)) {
+            return;
+        }
+
+        int32_t top_k_base = req_id * num_top_k_;
+        int32_t buffer_base = req_id * hot_buffer_size_;
+
+        // Allocate UB (Unified Buffer) memory
+        // tokens_ub: [hot_buffer_size] int32  - device buffer tokens
+        // lru_ub:    [hot_buffer_size] uint32 - LRU timestamps
+        // query_ub:  [SIMD_WIDTH] int32      - broadcast query for SIMD compare
+        TBuf<TPosition::VECCALC> buf_tokens;
+        TBuf<TPosition::VECCALC> buf_lru;
+        TBuf<TPosition::VECCALC> buf_query;
+
+        LocalTensor<int32_t> tokens_ub = buf_tokens.Get<int32_t>(0);
+        LocalTensor<uint32_t> lru_ub = buf_lru.Get<uint32_t>(0);
+        LocalTensor<int32_t> query_ub = buf_query.Get<int32_t>(0);
+
+        // Step 1: Load device_buffer_tokens and lru_slots from GM to UB
+        DataCopy(tokens_ub, device_buffer_tokens_gm_ + buffer_base, hot_buffer_size_);
+        DataCopy(lru_ub, lru_slots_gm_ + buffer_base, hot_buffer_size_);
+        PipeBarrier<PIPE_ALL>();
+
+        // Initialize current timestamp: max existing timestamp + 1
+        current_time_ = 0;
+        for (int32_t i = 0; i < hot_buffer_size_; i++) {
+            uint32_t ts;
+            DataCopy(&ts, lru_ub + i, 1);
+            if (ts > current_time_) {
+                current_time_ = ts;
+            }
+        }
+        current_time_++;
+
+        // Step 2: Process each top-k token
+        for (int32_t tk = 0; tk < num_top_k_; tk++) {
+            int32_t token_id = top_k_tokens_ptr_[top_k_base + tk];
+
+            if (token_id < 0) {
+                // Invalid token, output -1
+                top_k_device_locs_ptr_[top_k_base + tk] = INVALID_TOKEN;
+                continue;
+            }
+
+            // Fast path: if token_id is within hot_buffer_size range,
+            // check direct mapping first. This is equivalent to the
+            // "seq_len <= HOT_BUFFER_SIZE" fast path in the CUDA version.
+            if (token_id < hot_buffer_size_) {
+                int32_t stored_token;
+                DataCopy(&stored_token, tokens_ub + token_id, 1);
+                PipeBarrier<PIPE_ALL>();
+
+                if (stored_token == token_id) {
+                    // Hit: direct lookup
+                    top_k_device_locs_ptr_[top_k_base + tk] =
+                        device_buffer_locs_ptr_[buffer_base + token_id];
+
+                    // Update LRU timestamp
+                    DataCopy(lru_ub + token_id, &current_time_, 1);
+                    PipeBarrier<PIPE_ALL>();
+                    current_time_++;
+                    continue;
+                }
+            }
+
+            // Step 3: SIMD parallel hit detection in device_buffer_tokens
+            int32_t hit_slot = -1;
+
+            // Broadcast token_id to query_ub for vector comparison
+            for (int32_t i = 0; i < SIMD_WIDTH; i++) {
+                DataCopy(query_ub + i, &token_id, 1);
+            }
+            PipeBarrier<PIPE_ALL>();
+
+            // SIMD compare: VecCmpEQ returns a bitmask where each bit
+            // indicates whether the corresponding element matches.
+            for (int32_t s = 0; s < hot_buffer_size_; s += SIMD_WIDTH) {
+                int32_t actual_width = (s + SIMD_WIDTH <= hot_buffer_size_) ?
+                                        SIMD_WIDTH : (hot_buffer_size_ - s);
+
+                // VecCmpEQ: Compare query_ub with tokens_ub[s:s+actual_width]
+                // Returns uint64_t bitmask.
+                // Note: On some CANN versions, VecCmpEQ may have a different
+                // signature (e.g., writing to a mask LocalTensor). Adjust
+                // accordingly if compilation fails.
+                uint64_t mask = VecCmpEQ(
+                    query_ub,
+                    tokens_ub + s,
+                    actual_width
+                );
+
+                if (mask != 0) {
+                    int32_t bit = FindFirstBit(mask);
+                    if (bit >= 0 && bit < actual_width) {
+                        hit_slot = s + bit;
+                        break;
+                    }
+                }
+            }
+
+            if (hit_slot >= 0) {
+                // ===== HIT =====
+                // Output device buffer location
+                top_k_device_locs_ptr_[top_k_base + tk] =
+                    device_buffer_locs_ptr_[buffer_base + hit_slot];
+
+                // Update LRU timestamp for this slot
+                DataCopy(lru_ub + hit_slot, &current_time_, 1);
+                PipeBarrier<PIPE_ALL>();
+                current_time_++;
+            } else {
+                // ===== MISS =====
+                // 1. Find LRU slot (minimum timestamp) via SIMD scan
+                int32_t evict_slot = FindLruSlot(lru_ub);
+
+                // 2. Load from Host Pinned Memory to Device Buffer via MTE
+                //    Use CacheMode::NoCache to avoid polluting L0 Buffer
+                LoadFromHost(req_id, token_id, evict_slot, buffer_base);
+
+                // 3. Update device_buffer_tokens: evict_slot now holds token_id
+                DataCopy(tokens_ub + evict_slot, &token_id, 1);
+                PipeBarrier<PIPE_ALL>();
+
+                // 4. Update LRU timestamp for the newly loaded slot
+                DataCopy(lru_ub + evict_slot, &current_time_, 1);
+                PipeBarrier<PIPE_ALL>();
+                current_time_++;
+
+                // 5. Output device buffer location for the evicted slot
+                top_k_device_locs_ptr_[top_k_base + tk] =
+                    device_buffer_locs_ptr_[buffer_base + evict_slot];
+            }
+        }
+
+        // Step 4: Write back updated LRU timestamps and device_buffer_tokens to GM
+        DataCopy(lru_slots_gm_ + buffer_base, lru_ub, hot_buffer_size_);
+        DataCopy(device_buffer_tokens_gm_ + buffer_base, tokens_ub, hot_buffer_size_);
+        PipeBarrier<PIPE_ALL>();
+    }
+
+private:
+    // ========================================================================
+    // Helper Functions
+    // ========================================================================
+
+    /**
+     * @brief Find the first set bit in a uint64_t mask.
+     * @param mask SIMD comparison result bitmask.
+     * @return Index of first set bit (0-63), or -1 if mask is 0.
+     */
+    __aicore__ inline int32_t FindFirstBit(uint64_t mask) {
+        if (mask == 0) {
+            return -1;
+        }
+        // __builtin_ctzll: Count Trailing Zeros for uint64_t.
+        // Available in LLVM/GCC (CANN compiler is LLVM-based).
+        // For mask == 0, behavior is undefined, so we guard above.
+        return static_cast<int32_t>(__builtin_ctzll(mask));
+    }
+
+    /**
+     * @brief Find the LRU slot using SIMD-parallel minimum timestamp search.
+     * 
+     * Current implementation uses sequential scan for simplicity.
+     * TODO: Optimize with VecReduceMin or parallel tree reduction if available.
+     * 
+     * @param lru_ub UB tensor containing timestamps [hot_buffer_size].
+     * @return Index of slot with minimum timestamp.
+     */
+    __aicore__ inline int32_t FindLruSlot(LocalTensor<uint32_t> lru_ub) {
+        uint32_t min_ts;
+        DataCopy(&min_ts, lru_ub, 1);
+        int32_t min_slot = 0;
+
+        for (int32_t i = 1; i < hot_buffer_size_; i++) {
+            uint32_t ts;
+            DataCopy(&ts, lru_ub + i, 1);
+            if (ts < min_ts) {
+                min_ts = ts;
+                min_slot = i;
+            }
+        }
+        return min_slot;
+    }
+
+    /**
+     * @brief Load KV data from Host Pinned Memory to Device Buffer.
+     * 
+     * Uses MTE DataCopy engine. The source is in host cache, destination
+     * is in device buffer. item_size_bytes may be large (e.g., 512+ bytes).
+     * 
+     * Note: CacheMode::NoCache is used to avoid allocating L0 cache lines
+     * for the streaming data (equivalent to CUDA L1::no_allocate).
+     * 
+     * @param req_id    Request ID
+     * @param token_id  Token ID to load from host cache
+     * @param evict_slot Slot in device buffer being evicted
+     * @param buffer_base Base offset for this request in device buffer
+     */
+    __aicore__ inline void LoadFromHost(
+        uint32_t req_id,
+        int32_t token_id,
+        int32_t evict_slot,
+        int32_t buffer_base
+    ) {
+        // Get host cache index from host_cache_locs[req_id, token_id]
+        int64_t host_idx = host_cache_locs_ptr_[req_id * max_seq_len_ + token_id];
+
+        // Get device buffer index from device_buffer_locs[req_id, evict_slot]
+        int32_t device_idx = device_buffer_locs_ptr_[buffer_base + evict_slot];
+
+        // Compute byte offsets. Since the tensors are uint8_t, element offset
+        // equals byte offset.
+        int64_t host_offset = host_idx * item_size_bytes_;
+        int64_t device_offset = device_idx * item_size_bytes_;
+
+        // MTE DataCopy from Host to Device.
+        // Using CacheMode::NoCache to avoid polluting L0/L1 cache.
+        // 
+        // Note: The exact syntax for CacheMode may vary by CANN version:
+        //   - DataCopy<CacheMode::NoCache>(dst, src, count)
+        //   - DataCopy(dst, src, count, CacheMode::NoCache)
+        // If compilation fails, consult the CANN documentation for your version.
+        DataCopy(
+            device_buffer_k_gm_ + device_offset,
+            host_cache_k_gm_ + host_offset,
+            static_cast<uint32_t>(item_size_bytes_)
+        );
+        PipeBarrier<PIPE_ALL>();
+    }
+
+    // ========================================================================
+    // Member Variables
+    // ========================================================================
+
+    // __gm__ pointers for scalar direct access
+    __gm__ int32_t* top_k_tokens_ptr_;
+    __gm__ int32_t* device_buffer_tokens_ptr_;
+    __gm__ int64_t* host_cache_locs_ptr_;
+    __gm__ int32_t* device_buffer_locs_ptr_;
+    __gm__ uint8_t* host_cache_k_ptr_;
+    __gm__ uint8_t* device_buffer_k_ptr_;
+    __gm__ int32_t* top_k_device_locs_ptr_;
+    __gm__ uint32_t* lru_slots_ptr_;
+    __gm__ int32_t* num_real_reqs_ptr_;
+
+    // GlobalTensors for vector operations
+    GlobalTensor<int32_t> top_k_tokens_gm_;
+    GlobalTensor<int32_t> device_buffer_tokens_gm_;
+    GlobalTensor<int32_t> device_buffer_locs_gm_;
+    GlobalTensor<int64_t> host_cache_locs_gm_;
+    GlobalTensor<uint8_t> host_cache_k_gm_;
+    GlobalTensor<uint8_t> device_buffer_k_gm_;
+    GlobalTensor<uint32_t> lru_slots_gm_;
+    GlobalTensor<int32_t> top_k_device_locs_gm_;
+
+    // Runtime parameters
+    int32_t num_reqs_;
+    int64_t item_size_bytes_;
+    int32_t num_top_k_;
+    int32_t hot_buffer_size_;
+    int32_t max_seq_len_;
+    uint32_t current_time_;
+};
+
+// ============================================================================
+// Kernel Entry Point
+// ============================================================================
+
+/**
+ * @brief Kernel entry for load_cache_to_device_buffer_mla
+ * 
+ * Grid dimension: num_reqs blocks (one block per request)
+ * Block dimension: 1 thread (each block handles one request independently)
+ * 
+ * @param top_k_tokens          [num_reqs, num_top_k] int32 - tokens to look up
+ * @param device_buffer_tokens  [num_reqs, hot_buffer_size] int32 - cached tokens
+ * @param host_cache_locs       [num_reqs, max_seq_len] int64 - host cache indices
+ * @param device_buffer_locs    [num_reqs, hot_buffer_size] int32 - device buffer indices
+ * @param host_cache_k          Host KV cache data (uint8 bytes)
+ * @param device_buffer_k       Device KV buffer data (uint8 bytes)
+ * @param top_k_device_locs     Output: [num_reqs, num_top_k] int32 - device locations
+ * @param lru_slots             [num_reqs, hot_buffer_size] uint32 - LRU timestamps
+ * @param num_real_reqs         [1] int32 - actual number of requests to process
+ * @param num_reqs              Total number of requests (grid dimension hint)
+ * @param item_size_bytes       Size of each KV item in bytes
+ * @param num_top_k             Number of top-k tokens per request
+ * @param hot_buffer_size       Size of hot buffer per request
+ */
+extern "C" __global__ __aicore__ void load_cache_to_device_buffer_mla(
+    GM_ADDR top_k_tokens,
+    GM_ADDR device_buffer_tokens,
+    GM_ADDR host_cache_locs,
+    GM_ADDR device_buffer_locs,
+    GM_ADDR host_cache_k,
+    GM_ADDR device_buffer_k,
+    GM_ADDR top_k_device_locs,
+    GM_ADDR lru_slots,
+    GM_ADDR num_real_reqs,
+    int32_t num_reqs,
+    int64_t item_size_bytes,
+    int32_t num_top_k,
+    int32_t hot_buffer_size
+) {
+    LoadCacheToDeviceBufferMla op;
+    op.Init(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache_k,
+        device_buffer_k,
+        top_k_device_locs,
+        lru_slots,
+        num_real_reqs,
+        num_reqs,
+        item_size_bytes,
+        num_top_k,
+        hot_buffer_size
+    );
+    op.Process();
+}
