@@ -1,0 +1,89 @@
+{
+  "op": "HisparseLoadCache",
+  "op_type": "HisparseLoadCache",
+  "input_desc": [
+    {
+      "name": "top_k_tokens",
+      "param_type": "required",
+      "type": "int32",
+      "shape": [-1, -1],
+      "format": "ND"
+    },
+    {
+      "name": "device_buffer_tokens",
+      "param_type": "required",
+      "type": "int32",
+      "shape": [-1, -1],
+      "format": "ND"
+    },
+    {
+      "name": "host_cache_locs",
+      "param_type": "required",
+      "type": "int64",
+      "shape": [-1, -1],
+      "format": "ND"
+    },
+    {
+      "name": "device_buffer_locs",
+      "param_type": "required",
+      "type": "int32",
+      "shape": [-1, -1],
+      "format": "ND"
+    },
+    {
+      "name": "host_cache",
+      "param_type": "required",
+      "type": "uint8",
+      "shape": [-1],
+      "format": "ND"
+    },
+    {
+      "name": "device_buffer",
+      "param_type": "required",
+      "type": "uint8",
+      "shape": [-1],
+      "format": "ND"
+    },
+    {
+      "name": "lru_slots",
+      "param_type": "required",
+      "type": "uint32",
+      "shape": [-1, -1],
+      "format": "ND"
+    },
+    {
+      "name": "num_real_reqs",
+      "param_type": "required",
+      "type": "int32",
+      "shape": [1],
+      "format": "ND"
+    }
+  ],
+  "output_desc": [
+    {
+      "name": "top_k_device_locs",
+      "param_type": "required",
+      "type": "int32",
+      "shape": [-1, -1],
+      "format": "ND"
+    },
+    {
+      "name": "updated_lru",
+      "param_type": "required",
+      "type": "uint32",
+      "shape": [-1, -1],
+      "format": "ND"
+    },
+    {
+      "name": "updated_buffer_tokens",
+      "param_type": "required",
+      "type": "int32",
+      "shape": [-1, -1],
+      "format": "ND"
+    }
+  ],
+  "impl_path": "./hisparse_npu.cce",
+  "compile_params": {
+    "soc_version": "Ascend910B"
+  }
+}
